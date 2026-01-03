@@ -1,17 +1,14 @@
 # Prediction interface for Cog ⚙️
 # https://cog.run/python
 
-from typing import Optional
 import os
-import cv2
 import time
 import torch
-import imageio
 import subprocess
 import numpy as np
 from PIL import Image
 from cog import BasePredictor, Input, Path
-from transformers import Sam3VideoModel, Sam3VideoProcessor
+from transformers import Sam3Model, Sam3Processor
 
 MODEL_PATH = "checkpoints"
 MODEL_URL = "https://weights.replicate.delivery/default/facebook/sam3/model.tar"
@@ -27,36 +24,42 @@ class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        # Use bfloat16 if available (Ampere+), else float16
-        self.dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+        
+        # Use bfloat16 on GPU if available, else float16 on GPU, float32 on CPU
+        if self.device == "cuda":
+            self.dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        else:
+            self.dtype = torch.float32  # CPU requires float32 for stability
         
         # Download weights if they don't exist
         if not os.path.exists(MODEL_PATH):
             download_weights(MODEL_URL, MODEL_PATH)
         
         print(f"Loading model from {MODEL_PATH} to {self.device} with {self.dtype}...")
-        self.model = Sam3VideoModel.from_pretrained(MODEL_PATH).to(self.device, dtype=self.dtype).eval()
-        self.processor = Sam3VideoProcessor.from_pretrained(MODEL_PATH)
+        self.model = Sam3Model.from_pretrained(MODEL_PATH).to(self.device, dtype=self.dtype).eval()
+        self.processor = Sam3Processor.from_pretrained(MODEL_PATH)
         print("Model loaded successfully!")
 
     def predict(
         self,
-        video: Path = Input(description="Input video file"),
+        image: Path = Input(description="Input image file"),
         prompt: str = Input(description="Text prompt for segmentation", default="person"),
-        visual_prompt: Optional[str] = Input(
-            description="Optional: JSON string defining visual prompts (points/labels) or bounding boxes",
-            default=None
+        threshold: float = Input(
+            description="Confidence threshold for object detection",
+            default=0.5,
+            ge=0.0,
+            le=1.0
         ),
-        negative_prompt: Optional[str] = Input(
-            description="Optional: Text prompt for objects to exclude",
-            default=None
+        save_overlay: bool = Input(
+            description="If True, includes the overlay image in the ZIP file",
+            default=False
         ),
         mask_only: bool = Input(
-            description="If True, returns a black-and-white mask video instead of an overlay on the original video",
+            description="If True, returns a black-and-white mask image instead of an overlay on the original image",
             default=False
         ),
         return_zip: bool = Input(
-            description="If True, returns a ZIP file containing individual frame masks as PNGs",
+            description="If True, returns a ZIP file containing individual masks as PNGs instead of a single image",
             default=False
         ),
         mask_opacity: float = Input(
@@ -72,166 +75,82 @@ class Predictor(BasePredictor):
     ) -> Path:
         """Run a single prediction on the model"""
         
-        # 1. Load video frames
-        print(f"Processing video: {video}")
-        cap = cv2.VideoCapture(str(video))
-        frames = []
-        original_fps = cap.get(cv2.CAP_PROP_FPS)
-        if original_fps <= 0:
-            original_fps = 30.0
+        # 1. Load image
+        print(f"Processing image: {image}", flush=True)
+        pil_image = Image.open(str(image)).convert("RGB")
+        
+        # 2. Prepare inputs
+        print(f"Adding text prompt: '{prompt}'", flush=True)
+        inputs = self.processor(images=pil_image, text=prompt, return_tensors="pt").to(self.device)
+        
+        print(f"Input keys: {list(inputs.keys())}", flush=True)
+        for key in inputs:
+            if isinstance(inputs[key], torch.Tensor):
+                print(f"  {key}: shape={inputs[key].shape}, dtype={inputs[key].dtype}", flush=True)
+        
+        # Cast float tensors to the correct dtype
+        for key in inputs:
+            if isinstance(inputs[key], torch.Tensor) and inputs[key].is_floating_point():
+                inputs[key] = inputs[key].to(dtype=self.dtype)
+        
+        # 3. Inference
+        print(f"Running inference on {self.device} with {self.dtype}...", flush=True)
+        import sys
+        sys.stdout.flush()
+        sys.stderr.flush()
+        
+        with torch.inference_mode():
+            outputs = self.model(**inputs)
+        
+        print("Inference complete!", flush=True)
             
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(Image.fromarray(frame))
-        cap.release()
-
-        if not frames:
-            raise ValueError("Could not load frames from video")
+        # 4. Post-process results
+        target_sizes = inputs.get("original_sizes").tolist()
+        results = self.processor.post_process_instance_segmentation(
+            outputs,
+            threshold=threshold,
+            mask_threshold=0.5,
+            target_sizes=target_sizes
+        )[0]
         
-        print(f"Loaded {len(frames)} frames. FPS: {original_fps}")
-
-        # 2. Initialize inference session
-        # SAM3 Video allows loading the whole video into a session
-        inference_session = self.processor.init_video_session(
-            video=frames,
-            inference_device=self.device,
-            processing_device="cpu", # Keep processing on CPU to save VRAM if needed, or use self.device
-            video_storage_device="cpu",
-            dtype=self.dtype
-        )
+        masks = results['masks'] # Binary masks
+        print(f"Found {len(masks)} objects")
         
-        # 3. Add text prompt
-        if prompt is not None and prompt != "":
-            print(f"Adding text prompt: '{prompt}'")
-            inference_session = self.processor.add_text_prompt(
-                inference_session=inference_session,
-                text=prompt
-            )
-        
-        # 3b. Visual prompts
-        if visual_prompt is not None:
-            import json
-            try:
-                v_prompt_data = json.loads(visual_prompt)
-                # Format expected:
-                # {
-                #   "frame_idx": 0,
-                #   "points": [[x, y], [x, y]],
-                #   "labels": [1, 0],  # 1=positive, 0=negative
-                #   "box": [x1, y1, x2, y2]
-                # }
-                # Note: SAM3 processor expects specific tensor format, keeping it simple for now or pass raw args if processor handles it.
-                # Based on earlier research, SAM3 processor has methods for points/boxes.
-                # However, `Sam3VideoProcessor` API for adding visual prompts involves `add_inputs_to_inference_session`
-                
-                # This is a placeholder for complex visual prompt handling. 
-                # Implementing full parsing requires mapping user JSON to processor args.
-                # Assuming v_prompt_data is a list of prompt objects.
-                if isinstance(v_prompt_data, dict):
-                    v_prompt_data = [v_prompt_data]
-                    
-                for vp in v_prompt_data:
-                    frame_idx = vp.get('frame_idx', 0)
-                    points = vp.get('points', None)
-                    labels = vp.get('labels', None)
-                    box = vp.get('box', None) # xyxy
-                    
-                    # SAM3 Video Processor needs specific structure
-                    # input_points: [batch_size, num_objects, num_points, 2]
-                    # input_labels: [batch_size, num_objects, num_points]
-                    
-                    # Simplifying assumption: single object tracking
-                    input_points = None
-                    input_labels = None
-                    
-                    if points and labels:
-                        # Wrap for batch=1, obj=1
-                        input_points = [[points]] 
-                        input_labels = [[labels]]
-                    
-                    # For box, logic might be similar (add_text_prompt handles text, maybe there's add_visual_prompt?)
-                    # Actually `processor.add_inputs_to_inference_session` is the method for visual prompts (points/boxes).
-                    
-                    # We will skip full implementation of visual prompts in this turn to avoid breaking changes without testing,
-                    # but the input schema is ready for it.
-                    print(f"Visual prompt received for frame {frame_idx}, but full logic pending implementation.")
-                    
-            except json.JSONDecodeError:
-                 print("Error decoding visual_prompt JSON")
-
-        # 4. Propagate and track
-        print("Running inference...")
-        output_frames_data = {}
-        # Process all frames
-        for model_outputs in self.model.propagate_in_video_iterator(
-            inference_session=inference_session,
-            max_frame_num_to_track=len(frames)
-        ):
-            processed_outputs = self.processor.postprocess_outputs(inference_session, model_outputs)
-            output_frames_data[model_outputs.frame_idx] = processed_outputs
-            
         # 5. Generate output
-        save_fps = original_fps
+        output_dir = Path("/tmp/output_masks")
+        if os.path.exists(output_dir):
+            import shutil
+            shutil.rmtree(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
         
         if return_zip:
-            import zipfile
-            import shutil
+            # Save individual masks
+            for i, mask in enumerate(masks):
+                if isinstance(mask, torch.Tensor):
+                    mask = mask.cpu().numpy()
+                
+                mask_img = Image.fromarray((mask * 255).astype(np.uint8))
+                mask_img.save(os.path.join(output_dir, f"mask_{i:03d}.png"))
             
-            output_dir = Path("/tmp/output_masks")
-            if os.path.exists(output_dir):
-                shutil.rmtree(output_dir)
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # Save masks as PNGs
-            for frame_idx, results in output_frames_data.items():
-                masks = results.get('masks', None)
-                if masks is not None:
-                    if isinstance(masks, torch.Tensor):
-                        masks = masks.cpu().numpy()
-                    
-                    if len(masks) > 0:
-                        # Combine masks
-                        height, width = np.array(frames[0]).shape[:2]
-                        combined_mask = np.zeros((height, width), dtype=np.uint8)
-                         
-                        for mask in masks:
-                            if mask.ndim == 3 and mask.shape[0] == 1:
-                                mask = mask.squeeze(0)
-                            elif mask.ndim > 2:
-                                mask = mask.squeeze()
-                                
-                            if mask.shape != (height, width):
-                                mask = cv2.resize(mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST)
-                            
-                            # Ensure binary mask
-                            mask_bool = mask > 0.0
-                            combined_mask = np.logical_or(combined_mask, mask_bool)
-                            
-                        # Save as PNG (0 or 255)
-                        mask_img = Image.fromarray((combined_mask * 255).astype(np.uint8))
-                        mask_img.save(os.path.join(output_dir, f"mask_{frame_idx:05d}.png"))
-            
-            # Also save the overlay video in the zip? Or just the zip?
-            # Plan says bundle video and masks if return_zip is True.
-            video_path = os.path.join(output_dir, "overlay.mp4")
-            self._save_video(frames, output_frames_data, video_path, fps=save_fps, mask_opacity=mask_opacity, mask_color=mask_color, mask_only=mask_only)
+            # Also save the overlay image for reference
+            if save_overlay:
+                overlay_path = os.path.join(output_dir, "overlay.png")
+                self._save_image(pil_image, masks, overlay_path, mask_opacity=mask_opacity, mask_color=mask_color, mask_only=mask_only)
 
             # Create Zip
+            import shutil
             output_zip_path = Path("/tmp/output.zip")
             shutil.make_archive("/tmp/output", 'zip', output_dir)
             return output_zip_path
             
         else:
-            output_path = Path("/tmp/output.mp4")
-            self._save_video(frames, output_frames_data, str(output_path), fps=save_fps, mask_opacity=mask_opacity, mask_color=mask_color, mask_only=mask_only)
+            output_path = Path("/tmp/output.png")
+            self._save_image(pil_image, masks, str(output_path), mask_opacity=mask_opacity, mask_color=mask_color, mask_only=mask_only)
             return output_path
 
-    def _save_video(self, frames, outputs_data, output_path, fps, mask_opacity=0.5, mask_color="green", mask_only=False):
-        print(f"Saving output video to {output_path}...")
-        height, width = np.array(frames[0]).shape[:2]
+    def _save_image(self, image, masks, output_path, mask_opacity=0.5, mask_color="green", mask_only=False):
+        print(f"Saving output image to {output_path}...")
+        width, height = image.size
         
         # Define colors
         colors = {
@@ -244,58 +163,40 @@ class Predictor(BasePredictor):
         }
         color_rgb = np.array(colors.get(mask_color.lower(), [0, 255, 0]), dtype=np.uint8)
         
-        writer = imageio.get_writer(output_path, fps=fps, codec='libx264', quality=None, pixelformat='yuv420p')
-
-        for idx, frame_pil in enumerate(frames):
-            frame_np = np.array(frame_pil)
+        image_np = np.array(image)
+        
+        if mask_only:
+            output_image = np.zeros_like(image_np)
+        else:
+            output_image = image_np.copy()
+            
+        if masks is not None and len(masks) > 0:
+            combined_mask = np.zeros((height, width), dtype=bool)
+            for mask in masks:
+                if isinstance(mask, torch.Tensor):
+                    mask = mask.cpu().numpy()
+                
+                # Handle dimensions
+                if mask.ndim == 3 and mask.shape[0] == 1:
+                    mask = mask.squeeze(0)
+                elif mask.ndim > 2:
+                    mask = mask.squeeze()
+                    
+                if mask.shape != (height, width):
+                    # Resize mask if needed
+                    mask_img = Image.fromarray(mask.astype(np.uint8))
+                    mask_img = mask_img.resize((width, height), resample=Image.NEAREST)
+                    mask = np.array(mask_img)
+                
+                combined_mask = np.logical_or(combined_mask, mask > 0.0)
+            
+            overlay_indices = combined_mask
             
             if mask_only:
-                # Start with black frame
-                output_frame = np.zeros_like(frame_np)
+                output_image[overlay_indices] = [255, 255, 255]
             else:
-                output_frame = frame_np.copy()
+                # Color overlay
+                output_image[overlay_indices] = (output_image[overlay_indices].astype(float) * (1 - mask_opacity) + color_rgb.astype(float) * mask_opacity).astype(np.uint8)
 
-            if idx in outputs_data:
-                results = outputs_data[idx]
-                # results has 'masks'
-                masks = results.get('masks', None)
-                
-                if masks is not None:
-                    # masks could be a tensor or list
-                    if isinstance(masks, torch.Tensor):
-                        masks = masks.cpu().numpy()
-                    
-                    # masks shape: [N, H, W] or [N, 1, H, W]
-                    if len(masks) > 0:
-                        combined_mask = np.zeros((height, width), dtype=bool)
-                        for mask in masks:
-                            # Handle dimensions
-                            if mask.ndim == 3 and mask.shape[0] == 1:
-                                mask = mask.squeeze(0)
-                            elif mask.ndim == 2:
-                                pass # [H, W]
-                            else:
-                                # Attempt to squeeze if needed
-                                mask = mask.squeeze()
-                            
-                            if mask.shape != (height, width):
-                                # Resize mask if needed (should not happen if postprocess uses original sizes)
-                                mask = cv2.resize(mask.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST)
-                            
-                            combined_mask = np.logical_or(combined_mask, mask > 0.0) # Threshold > 0 (logits) or > 0.5 (prob) depending on output. Usually postprocess returns binary or logits.
-                            # Based on search results, postprocess_outputs returns masks.
-                        
-                        # Apply overlay
-                        overlay_indices = combined_mask
-                        
-                        if mask_only:
-                            # White on black
-                            output_frame[overlay_indices] = [255, 255, 255]
-                        else:
-                            # Color overlay
-                            output_frame[overlay_indices] = (output_frame[overlay_indices] * (1 - mask_opacity) + color_rgb * mask_opacity).astype(np.uint8)
-            
-            writer.append_data(output_frame)
-            
-        writer.close()
-        print("Video saved.")
+        Image.fromarray(output_image).save(output_path)
+        print("Image saved.")
